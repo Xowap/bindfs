@@ -68,6 +68,7 @@
 #include "userinfo.h"
 #include "usermap.h"
 #include "misc.h"
+#include "log.h"
 
 /* SETTINGS */
 static struct Settings {
@@ -80,10 +81,10 @@ static struct Settings {
     const char *mntsrc;
     const char *mntdest;
     int mntsrc_fd;
-    
+
     char* original_working_dir;
     mode_t original_umask;
-    
+
     UserMap* usermap; /* From the --map option. */
     UserMap* usermap_reverse;
 
@@ -111,7 +112,7 @@ static struct Settings {
         CHMOD_IGNORE,
         CHMOD_DENY
     } chmod_policy;
-    
+
     int chmod_allow_x;
 
     struct permchain *chmod_permchain; /* the --chmod-filter option */
@@ -132,7 +133,9 @@ static struct Settings {
 
     int ctime_from_mtime;
     int hide_hard_links;
-    
+
+    char log_file[PATH_MAX];
+
 } settings;
 
 
@@ -254,7 +257,7 @@ static int getattr_common(const char *procpath, struct stat *stbuf)
     /* Possibly map user/group */
     stbuf->st_uid = usermap_get_uid_or_default(settings.usermap, stbuf->st_uid, stbuf->st_uid);
     stbuf->st_gid = usermap_get_gid_or_default(settings.usermap, stbuf->st_gid, stbuf->st_gid);
-    
+
     /* Report user-defined owner/group if specified */
     if (settings.new_uid != -1)
         stbuf->st_uid = settings.new_uid;
@@ -316,7 +319,7 @@ static void chown_new_file(const char *path, struct fuse_context *fc, int (*chow
         file_owner = -1;
         file_group = -1;
     }
-    
+
     file_owner = usermap_get_uid_or_default(settings.usermap_reverse, fc->uid, file_owner);
     file_group = usermap_get_gid_or_default(settings.usermap_reverse, fc->gid, file_group);
 
@@ -338,7 +341,7 @@ static void *bindfs_init()
 {
     assert(settings.permchain != NULL);
     assert(settings.mntsrc_fd > 0);
-    
+
     maybe_stdout_stderr_to_file();
 
     if (fchdir(settings.mntsrc_fd) != 0) {
@@ -423,9 +426,9 @@ static int bindfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     struct stat st;
     int result = 0;
     long pc_ret;
-    
+
     path = process_path(path);
-    
+
     pc_ret = pathconf(path, _PC_NAME_MAX);
     if (pc_ret < 0) {
         DPRINTF("pathconf failed: %s (%d)", strerror(errno), errno);
@@ -443,7 +446,7 @@ static int bindfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
         if (de == NULL) {
             break;
         }
-        
+
         memset(&st, 0, sizeof(st));
         st.st_ino = de->d_ino;
         st.st_mode = de->d_type << 12;
@@ -515,6 +518,10 @@ static int bindfs_unlink(const char *path)
     if (res == -1)
         return -errno;
 
+    if (*settings.log_file) {
+        log_write_entry(settings.log_file, "RM", path);
+    }
+
     return 0;
 }
 
@@ -559,6 +566,11 @@ static int bindfs_rename(const char *from, const char *to)
     if (res == -1)
         return -errno;
 
+    if (*settings.log_file) {
+        log_write_entry(settings.log_file, "<-", from);
+        log_write_entry(settings.log_file, "->", to);
+    }
+
     return 0;
 }
 
@@ -572,6 +584,10 @@ static int bindfs_link(const char *from, const char *to)
     res = link(from, to);
     if (res == -1)
         return -errno;
+
+    if (*settings.log_file) {
+        log_write_entry(settings.log_file, "WR", to);
+    }
 
     return 0;
 }
@@ -640,7 +656,7 @@ static int bindfs_chown(const char *path, uid_t uid, gid_t gid)
             return -EPERM;
         }
     }
-    
+
     if (gid != -1) {
         switch (settings.chgrp_policy) {
         case CHGRP_NORMAL:
@@ -674,6 +690,10 @@ static int bindfs_truncate(const char *path, off_t size)
     if (res == -1)
         return -errno;
 
+    if (*settings.log_file) {
+        log_write_entry(settings.log_file, "WR", path);
+    }
+
     return 0;
 }
 
@@ -686,6 +706,10 @@ static int bindfs_ftruncate(const char *path, off_t size,
     res = ftruncate(fi->fh, size);
     if (res == -1)
         return -errno;
+
+    if (*settings.log_file) {
+        log_touch(fi->fh);
+    }
 
     return 0;
 }
@@ -743,7 +767,7 @@ static int bindfs_read(const char *path, char *buf, size_t size, off_t offset,
 {
     int res;
     (void) path;
-    
+
     res = pread(fi->fh, buf, size, offset);
     if (res == -1)
         res = -errno;
@@ -760,6 +784,10 @@ static int bindfs_write(const char *path, const char *buf, size_t size,
     res = pwrite(fi->fh, buf, size, offset);
     if (res == -1)
         res = -errno;
+
+    if (*settings.log_file) {
+        log_touch(fi->fh);
+    }
 
     return res;
 }
@@ -779,9 +807,13 @@ static int bindfs_statfs(const char *path, struct statvfs *stbuf)
 
 static int bindfs_release(const char *path, struct fuse_file_info *fi)
 {
-    (void) path;
-    
+    path = process_path(path);
+
     close(fi->fh);
+
+    if (*settings.log_file) {
+        log_close(settings.log_file, fi->fh, path);
+    }
 
     return 0;
 }
@@ -813,7 +845,7 @@ static int bindfs_setxattr(const char *path, const char *name, const char *value
                            size_t size, int flags)
 {
     DPRINTF("setxattr %s %s=%s", path, name, value);
-    
+
     if (settings.xattr_policy == XATTR_READ_ONLY)
         return -EACCES;
 
@@ -834,7 +866,7 @@ static int bindfs_getxattr(const char *path, const char *name, char *value,
     int res;
 
     DPRINTF("getxattr %s %s", path, name);
-    
+
     path = process_path(path);
     /* fuse checks permissions for us */
 #ifdef HAVE_LGETXATTR
@@ -852,7 +884,7 @@ static int bindfs_listxattr(const char *path, char *list, size_t size)
     int res;
 
     DPRINTF("listxattr %s", path);
-    
+
     path = process_path(path);
     /* fuse checks permissions for us */
 #ifdef HAVE_LLISTXATTR
@@ -983,6 +1015,7 @@ static void print_usage(const char *progname)
            "  --hide-hard-links         Always report a hard link count of 1.\n"
            "  --multithreaded           Enable multithreaded mode. See man page\n"
            "                            for security issue with current implementation.\n"
+           "  --log-file                Specify a file to log FS changes.\n"
            "\n"
            "FUSE options:\n"
            "  -o opt[,opt,...]          Mount options.\n"
@@ -1165,7 +1198,7 @@ static int parse_mirrored_users(char* mirror)
             assert(j == settings.num_mirrored_members);
         }
     }
-    
+
     return 1;
 }
 
@@ -1177,11 +1210,11 @@ static int parse_user_map(UserMap *map, UserMap *reverse_map, char *spec)
     uid_t uid_from, uid_to;
     gid_t gid_from, gid_to;
     UsermapStatus status;
-    
+
     while (*p != '\0') {
         free(tmpstr);
         tmpstr = strdup_until(p, ",:");
-        
+
         if (tmpstr[0] == '@') { /* group */
             q = strstr(tmpstr, "/@");
             if (!q) {
@@ -1198,7 +1231,7 @@ static int parse_user_map(UserMap *map, UserMap *reverse_map, char *spec)
                 fprintf(stderr, "Invalid group: %s\n", tmpstr);
                 goto fail;
             }
-            
+
             status = usermap_add_gid(map, gid_from, gid_to);
             if (status != 0) {
                 fprintf(stderr, "%s\n", usermap_errorstr(status));
@@ -1209,9 +1242,9 @@ static int parse_user_map(UserMap *map, UserMap *reverse_map, char *spec)
                 fprintf(stderr, "%s\n", usermap_errorstr(status));
                 goto fail;
             }
-            
+
         } else {
-            
+
             q = strstr(tmpstr, "/");
             if (!q) {
                 fprintf(stderr, "Invalid syntax: expected user1/user2 but got `%s`\n", tmpstr);
@@ -1227,7 +1260,7 @@ static int parse_user_map(UserMap *map, UserMap *reverse_map, char *spec)
                 fprintf(stderr, "Invalid username: %s\n", tmpstr);
                 goto fail;
             }
-            
+
             status = usermap_add_uid(map, uid_from, uid_to);
             if (status != 0) {
                 fprintf(stderr, "%s\n", usermap_errorstr(status));
@@ -1239,7 +1272,7 @@ static int parse_user_map(UserMap *map, UserMap *reverse_map, char *spec)
                 goto fail;
             }
         }
-        
+
         while (*p != '\0' && *p != ',' && *p != ':') {
             ++p;
         }
@@ -1247,10 +1280,10 @@ static int parse_user_map(UserMap *map, UserMap *reverse_map, char *spec)
             ++p;
         }
     }
-    
+
     free(tmpstr);
     return 1;
-    
+
 fail:
     free(tmpstr);
     return 0;
@@ -1261,16 +1294,16 @@ static void maybe_stdout_stderr_to_file()
     /* TODO: make this a command line option. */
 #if 0
     int fd;
-    
+
     const char *filename = "bindfs.log";
     char *path = malloc(strlen(settings.original_working_dir) + 1 + strlen(filename) + 1);
     strcpy(path, settings.original_working_dir);
     strcat(path, "/");
     strcat(path, filename);
-    
+
     fd = open(path, O_CREAT | O_WRONLY, 0666);
     free(path);
-    
+
     fchmod(fd, 0777 & ~settings.original_umask);
     fflush(stdout);
     fflush(stderr);
@@ -1296,7 +1329,7 @@ static void setup_signal_handling()
     sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    
+
     sigaction(SIGUSR1, &sa, NULL);
 }
 
@@ -1343,6 +1376,7 @@ int main(int argc, char *argv[])
         char *create_for_group;
         char *create_with_perms;
         char *chmod_filter;
+        char *log_file;
         int no_allow_other;
         int multithreaded;
     } od;
@@ -1360,47 +1394,49 @@ int main(int argc, char *argv[])
     static const struct fuse_opt options[] = {
         OPT2("-h", "--help", OPTKEY_HELP),
         OPT2("-V", "--version", OPTKEY_VERSION),
-        
+
         OPT_OFFSET3("-u %s", "--force-user=%s", "force-user=%s", user, -1),
         OPT_OFFSET3("-g %s", "--force-group=%s", "force-group=%s", group, -1),
-        
+
         OPT_OFFSET3("--user=%s", "--owner=%s", "owner=%s", deprecated_user, -1),
         OPT_OFFSET2("--group=%s", "group=%s", deprecated_group, -1),
-        
+
         OPT_OFFSET3("-p %s", "--perms=%s", "perms=%s", perms, -1),
         OPT_OFFSET3("-m %s", "--mirror=%s", "mirror=%s", mirror, -1),
         OPT_OFFSET3("-M %s", "--mirror-only=%s", "mirror-only=%s", mirror_only, -1),
         OPT_OFFSET2("--map=%s", "map=%s", map, -1),
         OPT_OFFSET3("-n", "--no-allow-other", "no-allow-other", no_allow_other, -1),
-        
+
         OPT2("--create-as-user", "create-as-user", OPTKEY_CREATE_AS_USER),
         OPT2("--create-as-mounter", "create-as-mounter", OPTKEY_CREATE_AS_MOUNTER),
         OPT_OFFSET2("--create-for-user=%s", "create-for-user=%s", create_for_user, -1),
         OPT_OFFSET2("--create-for-group=%s", "create-for-group=%s", create_for_group, -1),
         OPT_OFFSET2("--create-with-perms=%s", "create-with-perms=%s", create_with_perms, -1),
-        
+
         OPT2("--chown-normal", "chown-normal", OPTKEY_CHOWN_NORMAL),
         OPT2("--chown-ignore", "chown-ignore", OPTKEY_CHOWN_IGNORE),
         OPT2("--chown-deny", "chown-deny", OPTKEY_CHOWN_DENY),
-        
+
         OPT2("--chgrp-normal", "chgrp-normal", OPTKEY_CHGRP_NORMAL),
         OPT2("--chgrp-ignore", "chgrp-ignore", OPTKEY_CHGRP_IGNORE),
         OPT2("--chgrp-deny", "chgrp-deny", OPTKEY_CHGRP_DENY),
-        
+
         OPT2("--chmod-normal", "chmod-normal", OPTKEY_CHMOD_NORMAL),
         OPT2("--chmod-ignore", "chmod-ignore", OPTKEY_CHMOD_IGNORE),
         OPT2("--chmod-deny", "chmod-deny", OPTKEY_CHMOD_DENY),
         OPT_OFFSET2("--chmod-filter=%s", "chmod-filter=%s", chmod_filter, -1),
         OPT2("--chmod-allow-x", "chmod-allow-x", OPTKEY_CHMOD_ALLOW_X),
-        
+
         OPT2("--xattr-none", "xattr-none", OPTKEY_XATTR_NONE),
         OPT2("--xattr-ro", "xattr-ro", OPTKEY_XATTR_READ_ONLY),
         OPT2("--xattr-rw", "xattr-rw", OPTKEY_XATTR_READ_WRITE),
-        
+
         OPT2("--realistic-permissions", "realistic-permissions", OPTKEY_REALISTIC_PERMISSIONS),
         OPT2("--ctime-from-mtime", "ctime-from-mtime", OPTKEY_CTIME_FROM_MTIME),
         OPT2("--hide-hard-links", "hide-hard-links", OPTKEY_HIDE_HARD_LINKS),
         OPT_OFFSET2("--multithreaded", "multithreaded", multithreaded, -1),
+        OPT_OFFSET2("--log-file=%s", "log-file=%s", log_file, -1),
+
         FUSE_OPT_END
     };
 
@@ -1437,7 +1473,7 @@ int main(int argc, char *argv[])
     settings.ctime_from_mtime = 0;
     settings.hide_hard_links = 0;
     atexit(&atexit_func);
-    
+
     /* Parse options */
     if (fuse_opt_parse(&args, &od, options, &process_option) == -1)
         return 1;
@@ -1447,7 +1483,7 @@ int main(int argc, char *argv[])
         print_usage(my_basename(argv[0]));
         return 1;
     }
-    
+
     /* Check for deprecated options */
     if (od.deprecated_user) {
         fprintf(stderr, "Deprecation warning: please use --force-user instead of --user or --owner.\n");
@@ -1477,7 +1513,7 @@ int main(int argc, char *argv[])
             return 1;
         }
     }
-    
+
     /* Parse usermap */
     if (od.map) {
         if (getuid() != 0) {
@@ -1553,6 +1589,11 @@ int main(int argc, char *argv[])
         fuse_opt_add_arg(&args, "-s");
     }
 
+    /* Is there any log file? */
+    if (od.log_file) {
+        realpath(od.log_file, settings.log_file);
+    }
+
     /* Add default fuse options */
     if (!od.no_allow_other) {
         fuse_opt_add_arg(&args, "-oallow_other");
@@ -1560,11 +1601,11 @@ int main(int argc, char *argv[])
 
     /* We want the kernel to do our access checks for us based on what getattr gives it. */
     fuse_opt_add_arg(&args, "-odefault_permissions");
-    
+
     /* We want to mirror inodes. */
     fuse_opt_add_arg(&args, "-ouse_ino");
     fuse_opt_add_arg(&args, "-oreaddir_ino");
-    
+
     /* We need to disable the attribute cache whenever two users
        can see different attributes. For now, only mirroring can do that. */
     if (is_mirroring_enabled()) {
